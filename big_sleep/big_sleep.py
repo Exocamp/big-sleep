@@ -15,6 +15,7 @@ from torch import nn
 from torch.optim import Adam
 from torchvision.utils import save_image
 import torchvision.transforms as T
+import numpy as np
 from PIL import Image
 from tqdm import tqdm, trange
 
@@ -132,7 +133,10 @@ def rand_cutout(image, size, center_bias=False, center_focus=2):
 
 # load clip
 
-perceptor, normalize_image = load('ViT-B/32', jit = False)
+perceptor, normalize_image = load('ViT-B/16', jit = False)
+perceptor = perceptor.eval()
+for param in perceptor.parameters():
+  param.requires_grad = False
 
 # load biggan
 
@@ -321,6 +325,8 @@ class Imagine(nn.Module):
     ):
         super().__init__()
 
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
         if torch_deterministic:
             assert not bilinear, 'the deterministic (seeded) operation does not work with interpolation (PyTorch 1.7.1)'
             torch.set_deterministic(True)
@@ -346,7 +352,7 @@ class Imagine(nn.Module):
             ema_decay = ema_decay,
             num_cutouts = num_cutouts,
             center_bias = center_bias,
-        ).cuda()
+        ).to(self.device)
 
         self.model = model
 
@@ -383,7 +389,7 @@ class Imagine(nn.Module):
         self.text = text
         self.img = img
         if encoding is not None:
-            encoding = encoding.cuda()
+            encoding = encoding.to(self.device)
         #elif self.create_story:
         #    encoding = self.update_story_encoding(epoch=0, iteration=1)
         elif text is not None and img is not None:
@@ -395,7 +401,7 @@ class Imagine(nn.Module):
         return encoding
 
     def create_text_encoding(self, text):
-        tokenized_text = tokenize(text).cuda()
+        tokenized_text = tokenize(text).to(self.device)
         with torch.no_grad():
             text_encoding = perceptor.encode_text(tokenized_text).detach()
         return text_encoding
@@ -403,7 +409,7 @@ class Imagine(nn.Module):
     def create_img_encoding(self, img):
         if isinstance(img, str):
             img = Image.open(img)
-        normed_img = self.clip_transform(img).unsqueeze(0).cuda()
+        normed_img = self.clip_transform(img).unsqueeze(0).to(self.device)
         with torch.no_grad():
             img_encoding = perceptor.encode_image(normed_img).detach()
         return img_encoding
