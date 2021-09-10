@@ -17,6 +17,7 @@ import torch
 from PIL import Image
 from torchvision.transforms import Compose, Resize, CenterCrop, ToTensor, Normalize
 from tqdm import tqdm
+from rotary_embedding_torch import apply_rotary_emb, RotaryEmbedding, broadcat
 
 try:
     from torchvision.transforms import InterpolationMode
@@ -390,6 +391,12 @@ class ResidualAttentionBlock(nn.Module):
 
     def attention(self, x: torch.Tensor):
         self.attn_mask = self.attn_mask.to(dtype=x.dtype, device=x.device) if self.attn_mask is not None else None
+        #Rotary embeddings
+        seq_length = x.shape[1] #i have no idea if this is actually the sequence length.
+        rot_emb = RotaryEmbedding(dim = 32, freqs_for = "lang")
+        freqs = rot_emb(torch.arange(seq_length), cache_key = seq_length).to(dtype=x.dtype, device=x.device)
+        freqs = freqs[None, ...]
+        x = apply_rotary_emb(freqs, x)
         return self.attn(x, x, x, need_weights=False, attn_mask=self.attn_mask)[0]
 
     def forward(self, x: torch.Tensor):
