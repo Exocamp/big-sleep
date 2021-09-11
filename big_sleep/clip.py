@@ -18,6 +18,7 @@ from PIL import Image
 from torchvision.transforms import Compose, Resize, CenterCrop, ToTensor, Normalize
 from tqdm import tqdm
 from rotary_embedding_torch import apply_rotary_emb, RotaryEmbedding, broadcat
+from vector_quantize_pytorch import VectorQuantize
 
 try:
     from torchvision.transforms import InterpolationMode
@@ -218,6 +219,24 @@ def tokenize(texts: Union[str, List[str]], context_length: int = 77, truncate: b
 
     return result
 
+#taken from lucidrain's x-transformer repo and enhanced with vector quantization
+class GEGLU(nn.Module):
+    def __init__(self):
+        super().__init__()
+        #nn.Linear(dim_in, dim_out * 2)
+        self.proj = nn.Linear(3, 6)
+        self.vq = VectorQuantize(
+            dim = 256,
+            codebook_size = 16384
+        )
+        #self.in_norm = nn.InstanceNorm1d(256)
+        
+    def forward(self, x):
+        x = self.vq(x)
+        x, gate = self.proj(x).chunk(2, dim = -1)
+        x = x * F.gelu(gate)
+        return x
+
 class Bottleneck(nn.Module):
     expansion = 4
 
@@ -236,7 +255,8 @@ class Bottleneck(nn.Module):
         self.conv3 = nn.Conv2d(planes, planes * self.expansion, 1, bias=False)
         self.bn3 = nn.BatchNorm2d(planes * self.expansion)
 
-        self.relu = nn.ReLU(inplace=True)
+        #self.relu = nn.ReLU(inplace=True)
+        self.relu = GEGLU()
         self.downsample = None
         self.stride = stride
 
@@ -322,7 +342,8 @@ class ModifiedResNet(nn.Module):
         self.conv3 = nn.Conv2d(width // 2, width, kernel_size=3, padding=1, bias=False)
         self.bn3 = nn.BatchNorm2d(width)
         self.avgpool = nn.AvgPool2d(2)
-        self.relu = nn.ReLU(inplace=True)
+        #self.relu = nn.ReLU(inplace=True)
+        self.relu = GEGLU()
 
         # residual layers
         self._inplanes = width  # this is a *mutable* variable used during construction
