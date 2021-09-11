@@ -7,3 +7,4 @@ regex
 torchvision>=0.8.2
 tqdm
 rotary-embedding-torch
+vector-quantize-torch

@@ -133,10 +133,12 @@ def rand_cutout(image, size, center_bias=False, center_focus=2):
 
 # load clip
 
-perceptor, normalize_image = load('ViT-B/16', jit = False)
+perceptor, normalize_image = load('ViT-B/32', jit = False)
 perceptor = perceptor.eval()
 for param in perceptor.parameters():
   param.requires_grad = False
+
+input_res = perceptor.visual.input_resolution
 
 # load biggan
 
@@ -179,8 +181,7 @@ class Model(nn.Module):
         self.biggan = BigGAN.from_pretrained(f'biggan-deep-{image_size}')
         self.max_classes = max_classes
         self.class_temperature = class_temperature
-        self.ema_decay\
-            = ema_decay
+        self.ema_decay = ema_decay
 
         self.init_latents()
 
@@ -253,9 +254,9 @@ class BigSleep(nn.Module):
             # get cutout
             apper = rand_cutout(out, size, center_bias=self.center_bias)
             if (self.experimental_resample):
-                apper = resample(apper, (224, 224))
+                apper = resample(apper, (input_res, input_res))
             else:
-                apper = F.interpolate(apper, (224, 224), **self.interpolation_settings)
+                apper = F.interpolate(apper, (input_res, input_res), **self.interpolation_settings)
             pieces.append(apper)
 
         into = torch.cat(pieces)
@@ -374,7 +375,7 @@ class Imagine(nn.Module):
             "min": []
         }
         # create img transform
-        self.clip_transform = create_clip_img_transform(224)
+        self.clip_transform = create_clip_img_transform(input_res)
         # create starting encoding
         self.set_clip_encoding(text=text, img=img, encoding=encoding, text_min=text_min)
     
