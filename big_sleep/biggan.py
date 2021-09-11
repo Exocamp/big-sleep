@@ -20,6 +20,7 @@ import boto3
 import requests
 from botocore.exceptions import ClientError
 from tqdm import tqdm
+from vector_quantize_pytorch import VectorQuantize
 
 try:
     from urllib.parse import urlparse
@@ -568,12 +569,15 @@ class BigGAN(nn.Module):
         self.config = config
         self.embeddings = nn.Linear(config.num_classes, config.z_dim, bias=False)
         self.generator = Generator(config)
+        self.vq = VectorQuantize(dim = 256, codebook_size = 1024)
 
     def forward(self, z, class_label, truncation):
         assert 0 < truncation <= 1
 
         embed = self.embeddings(class_label)
         cond_vector = torch.cat((z, embed), dim=1)
+        #quantize
+        cond_vector = self.vq(cond_vector)
 
         z = self.generator(cond_vector, truncation)
         return z
