@@ -133,12 +133,6 @@ def rand_cutout(image, size, center_bias=False, center_focus=2):
 
 # load clip
 
-perceptor, normalize_image = load('ViT-B/32', jit = False)
-perceptor = perceptor.eval()
-for param in perceptor.parameters():
-  param.requires_grad = False
-
-input_res = perceptor.visual.input_resolution
 
 # load biggan
 
@@ -204,6 +198,7 @@ class Model(nn.Module):
 class BigSleep(nn.Module):
     def __init__(
         self,
+        clip_perceptor,
         num_cutouts = 128,
         loss_coef = 100,
         image_size = 512,
@@ -220,6 +215,7 @@ class BigSleep(nn.Module):
         self.num_cutouts = num_cutouts
         self.experimental_resample = experimental_resample
         self.center_bias = center_bias
+        self.perceptor = clip_perceptor
 
         self.interpolation_settings = {'mode': 'bilinear', 'align_corners': False} if bilinear else {'mode': 'nearest'}
 
@@ -262,7 +258,7 @@ class BigSleep(nn.Module):
         into = torch.cat(pieces)
         into = normalize_image(into)
 
-        image_embed = perceptor.encode_image(into)
+        image_embed = self.perceptor.encode_image(into)
 
         latents, soft_one_hot_classes = self.model.latents()
         num_latents = latents.shape[0]
@@ -323,6 +319,7 @@ class Imagine(nn.Module):
         ema_decay = 0.99,
         num_cutouts = 128,
         center_bias = False,
+        clip_model = "ViT-B/32"
     ):
         super().__init__()
 
@@ -343,8 +340,16 @@ class Imagine(nn.Module):
 
         self.epochs = epochs
         self.iterations = iterations
+        
+        self.perceptor, normalize_image = load(clip_model, jit = False)
+        self.perceptor = self.perceptor.eval()
+        for param in self.perceptor.parameters():
+            param.requires_grad = False
+            
+        input_res = self.perceptor.visual.input_resolution
 
         model = BigSleep(
+            self.perceptor,
             image_size = image_size,
             bilinear = bilinear,
             max_classes = max_classes,
@@ -404,7 +409,7 @@ class Imagine(nn.Module):
     def create_text_encoding(self, text):
         tokenized_text = tokenize(text).to(self.device)
         with torch.no_grad():
-            text_encoding = perceptor.encode_text(tokenized_text).detach()
+            text_encoding = self.perceptor.encode_text(tokenized_text).detach()
         return text_encoding
     
     def create_img_encoding(self, img):
@@ -412,7 +417,7 @@ class Imagine(nn.Module):
             img = Image.open(img)
         normed_img = self.clip_transform(img).unsqueeze(0).to(self.device)
         with torch.no_grad():
-            img_encoding = perceptor.encode_image(normed_img).detach()
+            img_encoding = self.perceptor.encode_image(normed_img).detach()
         return img_encoding
     
     

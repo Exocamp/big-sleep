@@ -17,8 +17,6 @@ import torch
 from PIL import Image
 from torchvision.transforms import Compose, Resize, CenterCrop, ToTensor, Normalize
 from tqdm import tqdm
-from rotary_embedding_torch import apply_rotary_emb, RotaryEmbedding, broadcat
-from vector_quantize_pytorch import VectorQuantize
 
 try:
     from torchvision.transforms import InterpolationMode
@@ -115,20 +113,24 @@ def load(name: str, device: Union[str, torch.device] = "cuda" if torch.cuda.is_a
         # loading JIT archive
         model = torch.jit.load(model_path, map_location=device if jit else "cpu").eval()
         state_dict = None
+        print("We tried to load JIT and succeeded")
     except RuntimeError:
         # loading saved state dict
         if jit:
             warnings.warn(f"File {model_path} is not a JIT archive. Loading as a state dict instead")
             jit = False
         state_dict = torch.load(model_path, map_location="cpu")
+        print("We loaded this state dict!")
 
     if not jit:
+        print("We're in here now")
         model = build_model(state_dict or model.state_dict()).to(device)
         if str(device) == "cpu":
             model.float()
         return model, _transform()
 
     # patch the device names
+    print("Patching device names")
     device_holder = torch.jit.trace(lambda: torch.ones([]).to(torch.device(device)), example_inputs=[])
     device_node = [n for n in device_holder.graph.findAllNodes("prim::Constant") if "Device" in repr(n)][-1]
 
@@ -219,24 +221,6 @@ def tokenize(texts: Union[str, List[str]], context_length: int = 77, truncate: b
 
     return result
 
-#taken from lucidrain's x-transformer repo and enhanced with vector quantization
-class GEGLU(nn.Module):
-    def __init__(self):
-        super().__init__()
-        #nn.Linear(dim_in, dim_out * 2)
-        self.proj = nn.Linear(3, 6)
-        self.vq = VectorQuantize(
-            dim = 256,
-            codebook_size = 16384
-        )
-        #self.in_norm = nn.InstanceNorm1d(256)
-        
-    def forward(self, x):
-        x = self.vq(x)
-        x, gate = self.proj(x).chunk(2, dim = -1)
-        x = x * F.gelu(gate)
-        return x
-
 class Bottleneck(nn.Module):
     expansion = 4
 
@@ -255,8 +239,7 @@ class Bottleneck(nn.Module):
         self.conv3 = nn.Conv2d(planes, planes * self.expansion, 1, bias=False)
         self.bn3 = nn.BatchNorm2d(planes * self.expansion)
 
-        #self.relu = nn.ReLU(inplace=True)
-        self.relu = GEGLU()
+        self.relu = nn.ReLU(inplace=True)
         self.downsample = None
         self.stride = stride
 
@@ -342,8 +325,7 @@ class ModifiedResNet(nn.Module):
         self.conv3 = nn.Conv2d(width // 2, width, kernel_size=3, padding=1, bias=False)
         self.bn3 = nn.BatchNorm2d(width)
         self.avgpool = nn.AvgPool2d(2)
-        #self.relu = nn.ReLU(inplace=True)
-        self.relu = GEGLU()
+        self.relu = nn.ReLU(inplace=True)
 
         # residual layers
         self._inplanes = width  # this is a *mutable* variable used during construction
@@ -400,7 +382,8 @@ class ResidualAttentionBlock(nn.Module):
     def __init__(self, d_model: int, n_head: int, attn_mask: torch.Tensor = None):
         super().__init__()
 
-        self.attn = nn.MultiheadAttention(d_model, n_head)
+        #Instance both attentions at once to allow for weight transfer
+        self.attn = Attention(d_model, dim_head=d_model, heads=n_head, mask=attn_mask)
         self.ln_1 = LayerNorm(d_model)
         self.mlp = nn.Sequential(OrderedDict([
             ("c_fc", nn.Linear(d_model, d_model * 4)),
@@ -412,15 +395,11 @@ class ResidualAttentionBlock(nn.Module):
 
     def attention(self, x: torch.Tensor):
         self.attn_mask = self.attn_mask.to(dtype=x.dtype, device=x.device) if self.attn_mask is not None else None
-        #Rotary embeddings
-        seq_length = x.shape[1] #i have no idea if this is actually the sequence length.
-        rot_emb = RotaryEmbedding(dim = 32, freqs_for = "lang")
-        freqs = rot_emb(torch.arange(seq_length), cache_key = seq_length).to(dtype=x.dtype, device=x.device)
-        freqs = freqs[None, ...]
-        x = apply_rotary_emb(freqs, x)
-        return self.attn(x, x, x, need_weights=False, attn_mask=self.attn_mask)[0]
+        #return self.attn(x, x, x, need_weights=False, attn_mask=self.attn_mask)[0]
+        return self.attn(x)[0]
 
     def forward(self, x: torch.Tensor):
+        #macaron test
         x = x + self.attention(self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
         return x
@@ -551,8 +530,9 @@ class CLIP(nn.Module):
         attn_std = self.transformer.width ** -0.5
         fc_std = (2 * self.transformer.width) ** -0.5
         for block in self.transformer.resblocks:
-            nn.init.normal_(block.attn.in_proj_weight, std=attn_std)
-            nn.init.normal_(block.attn.out_proj.weight, std=proj_std)
+            nn.init.normal_(block.attn.to_q.weight, std=attn_std)
+            #print(block.attn.to_q.weight)
+            nn.init.normal_(block.attn.to_out.weight, std=proj_std)
             nn.init.normal_(block.mlp.c_fc.weight, std=fc_std)
             nn.init.normal_(block.mlp.c_proj.weight, std=proj_std)
 
@@ -564,6 +544,7 @@ class CLIP(nn.Module):
         # pytorch uses additive attention mask; fill with -inf
         mask = torch.empty(self.context_length, self.context_length)
         mask.fill_(float("-inf"))
+        #mask.fill_(1.)
         mask.triu_(1)  # zero out the lower diagonal
         return mask
 
@@ -615,11 +596,11 @@ def convert_weights(model: nn.Module):
             if l.bias is not None:
                 l.bias.data = l.bias.data.half()
 
-        if isinstance(l, nn.MultiheadAttention):
-            for attr in [*[f"{s}_proj_weight" for s in ["in", "q", "k", "v"]], "in_proj_bias", "bias_k", "bias_v"]:
+        if isinstance(l, Attention):
+            for attr in [*[f"to_out", "to_q", "to_k", "to_v"]]:
                 tensor = getattr(l, attr)
                 if tensor is not None:
-                    tensor.data = tensor.data.half()
+                    tensor.weight.data = tensor.weight.data.half()
 
         for name in ["text_projection", "proj"]:
             if hasattr(l, name):
@@ -631,30 +612,71 @@ def convert_weights(model: nn.Module):
 
 
 def build_model(state_dict: dict):
-    vit = "visual.proj" in state_dict
+    new_sd = state_dict.copy()
+    vit = "visual.proj" in new_sd
 
     if vit:
-        vision_width = state_dict["visual.conv1.weight"].shape[0]
-        vision_layers = len([k for k in state_dict.keys() if k.startswith("visual.") and k.endswith(".attn.in_proj_weight")])
-        vision_patch_size = state_dict["visual.conv1.weight"].shape[-1]
-        grid_size = round((state_dict["visual.positional_embedding"].shape[0] - 1) ** 0.5)
+        vision_width = new_sd["visual.conv1.weight"].shape[0]
+        vision_layers = len([k for k in new_sd.keys() if k.startswith("visual.") and k.endswith(".attn.in_proj_weight")])
+        #vision_layers = int(vision_layers / 3)
+        print(f"vision layers: {vision_layers}")
+        vision_patch_size = new_sd["visual.conv1.weight"].shape[-1]
+        grid_size = round((new_sd["visual.positional_embedding"].shape[0] - 1) ** 0.5)
         image_resolution = vision_patch_size * grid_size
     else:
-        counts: list = [len(set(k.split(".")[2] for k in state_dict if k.startswith(f"visual.layer{b}"))) for b in [1, 2, 3, 4]]
+        counts: list = [len(set(k.split(".")[2] for k in new_sd if k.startswith(f"visual.layer{b}"))) for b in [1, 2, 3, 4]]
         vision_layers = tuple(counts)
-        vision_width = state_dict["visual.layer1.0.conv1.weight"].shape[0]
-        output_width = round((state_dict["visual.attnpool.positional_embedding"].shape[0] - 1) ** 0.5)
+        vision_width = new_sd["visual.layer1.0.conv1.weight"].shape[0]
+        output_width = round((new_sd["visual.attnpool.positional_embedding"].shape[0] - 1) ** 0.5)
         vision_patch_size = None
-        assert output_width ** 2 + 1 == state_dict["visual.attnpool.positional_embedding"].shape[0]
+        assert output_width ** 2 + 1 == new_sd["visual.attnpool.positional_embedding"].shape[0]
         image_resolution = output_width * 32
 
-    embed_dim = state_dict["text_projection"].shape[1]
-    context_length = state_dict["positional_embedding"].shape[0]
-    vocab_size = state_dict["token_embedding.weight"].shape[0]
-    transformer_width = state_dict["ln_final.weight"].shape[0]
+    embed_dim = new_sd["text_projection"].shape[1]
+    context_length = new_sd["positional_embedding"].shape[0]
+    vocab_size = new_sd["token_embedding.weight"].shape[0]
+    transformer_width = new_sd["ln_final.weight"].shape[0]
     transformer_heads = transformer_width // 64
-    transformer_layers = len(set(k.split(".")[2] for k in state_dict if k.startswith(f"transformer.resblocks")))
+    transformer_layers = len(set(k.split(".")[2] for k in new_sd if k.startswith(f"transformer.resblocks")))
+    #transformer_layers = int(transformer_layers / 3)
+    print(f"transformer layers: {transformer_layers}")
 
+    #Transfer weights. I hate this lmao
+
+    with torch.no_grad():
+        for key in list(new_sd.keys()):
+            key_parts = key.split(".")
+            prefix = '.'.join(key_parts[:-1])
+            #Apply changes to transformer blocks only
+            if "transformer.resblocks" in key or "visual.transformer.resblocks" in key:
+                #print(key)
+                #convert in_proj_weight used by nn.MultiheadAttention() to q, k, v used by x-transformers
+                if key_parts[-1] == "in_proj_weight":
+                    print(f"Key of {key}: size of {new_sd[key].shape} | chunked: {new_sd[key].chunk(3)[0].shape}")
+                    new_sd[prefix + ".to_q.weight"] = new_sd[key].chunk(3)[0]
+                    new_sd[prefix + ".to_k.weight"] = new_sd[key].chunk(3)[1]
+                    new_sd[prefix + ".to_v.weight"] = new_sd[key].chunk(3)[2]
+                    del new_sd[key]
+                    #print("In projection weights converted")
+
+                #Just delete biases (good idea?? prolly not...)
+                elif key_parts[-1] == "in_proj_bias":
+                    del new_sd[key]
+                    #print("In projection bias deleted")
+
+                #Convert out_proj to to_out
+                elif key_parts[-2] == "out_proj":
+                    #print(key, state_dict[key].shape)
+                    key_parts[-2] = "to_out"
+                    new_sd[".".join(key_parts)] = nn.Parameter(new_sd[key])
+                    del new_sd[key]
+                    #print("Out projection converted")
+
+                else:
+                    #print(key, state_dict[key].shape)
+                    continue
+
+    print("We actually are loading CLIP now")
     model = CLIP(
         embed_dim,
         image_resolution, vision_layers, vision_width, vision_patch_size,
@@ -662,12 +684,16 @@ def build_model(state_dict: dict):
     )
 
     for key in ["input_resolution", "context_length", "vocab_size"]:
-        if key in state_dict:
-            del state_dict[key]
+        if key in new_sd:
+            del new_sd[key]
 
     convert_weights(model)
-    model.load_state_dict(state_dict)
-    return model.eval()
+    with torch.no_grad():
+        try:
+            model.load_state_dict(new_sd, strict=True)
+        except RuntimeError as e:
+            print('Ignoring "' + str(e) + '"')
+        return model.eval()
 
 import gzip
 import html
